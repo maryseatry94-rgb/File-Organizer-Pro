@@ -1,0 +1,628 @@
+# =============================================================================
+#  FILE ORGANIZER PRO — by Claude x Maryse
+#  Langage : Python 3.10+
+#  Dépendances : customtkinter, openai
+#  Installation : pip install customtkinter openai
+# =============================================================================
+
+import os
+import re
+import json
+import shutil
+import hashlib
+import threading
+from pathlib import Path
+from datetime import datetime
+
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+try:
+    import customtkinter as ctk
+    CTK = True
+except ImportError:
+    CTK = False
+
+# ─── Chemins de config ────────────────────────────────────────────────────────
+APP_DIR   = Path.home() / ".file_organizer_pro"
+CONFIG_F  = APP_DIR / "config.json"
+MEMORY_F  = APP_DIR / "memory.json"
+HISTORY_F = APP_DIR / "history.json"
+APP_DIR.mkdir(exist_ok=True)
+
+# ─── Catégories & extensions ─────────────────────────────────────────────────
+CATEGORIES = {
+    "3D": {
+        "extensions": {".blend",".fbx",".obj",".ma",".mb",".max",
+                       ".c4d",".3ds",".dae",".ztl",".zpr",".abc",
+                       ".usd",".usda",".usdz",".stl",".glb",".gltf"},
+        "icon": "📦", "color_dark": "#7C3AED", "color_light": "#6D28D9",
+    },
+    "Textures": {
+        "extensions": {".png",".jpg",".jpeg",".psd",".tga",".tiff",
+                       ".tif",".bmp",".exr",".hdr",".psb",".xcf",
+                       ".sbsar",".spp",".svg",".webp"},
+        "icon": "🎨", "color_dark": "#059669", "color_light": "#047857",
+    },
+    "Renders": {
+        "extensions": {".mp4",".avi",".mov",".mkv",".webm",".gif",".apng"},
+        "icon": "🎬", "color_dark": "#DC2626", "color_light": "#B91C1C",
+    },
+    "Docs": {
+        "extensions": {".pdf",".txt",".doc",".docx",".xlsx",".xls",
+                       ".pptx",".csv",".md",".rtf"},
+        "icon": "📄", "color_dark": "#D97706", "color_light": "#B45309",
+    },
+}
+
+THEMES = {
+    "Sombre Violet": {
+        "mode": "dark",
+        "bg":       "#0F0F1A",
+        "bg2":      "#1A1A2E",
+        "bg3":      "#12122A",
+        "accent":   "#7C3AED",
+        "accent2":  "#6D28D9",
+        "text":     "#E2D9F3",
+        "text2":    "#9D8EC7",
+        "success":  "#34D399",
+        "warning":  "#F59E0B",
+        "error":    "#EF4444",
+    },
+    "Sombre Bleu": {
+        "mode": "dark",
+        "bg":       "#0A0F1E",
+        "bg2":      "#0F1B35",
+        "bg3":      "#0D1628",
+        "accent":   "#2563EB",
+        "accent2":  "#1D4ED8",
+        "text":     "#DBEAFE",
+        "text2":    "#93C5FD",
+        "success":  "#34D399",
+        "warning":  "#F59E0B",
+        "error":    "#EF4444",
+    },
+    "Clair": {
+        "mode": "light",
+        "bg":       "#F5F5F5",
+        "bg2":      "#FFFFFF",
+        "bg3":      "#EBEBEB",
+        "accent":   "#7C3AED",
+        "accent2":  "#6D28D9",
+        "text":     "#1A1A2E",
+        "text2":    "#555577",
+        "success":  "#059669",
+        "warning":  "#D97706",
+        "error":    "#DC2626",
+    },
+}
+
+# ─── Helpers JSON ─────────────────────────────────────────────────────────────
+def load_json(path, default):
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
+
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+# ─── Logique fichiers ─────────────────────────────────────────────────────────
+def get_category(extension: str) -> str:
+    ext = extension.lower()
+    for cat, data in CATEGORIES.items():
+        if ext in data["extensions"]:
+            return cat
+    return "Autres"
+
+def file_hash(filepath: Path) -> str | None:
+    h = hashlib.md5()
+    try:
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+def extract_project(filename: str, known_projects: list[str]) -> str | None:
+    stem = Path(filename).stem.lower()
+    for proj in known_projects:
+        if proj.lower() in stem:
+            return proj
+    parts = re.split(r"[_\-\s]+", stem)
+    skip = {"final","test","new","old","copy","v1","v2","v3","v4","draft",
+            "temp","wip","backup","render","export","import"}
+    for part in parts:
+        if len(part) > 2 and part not in skip and not part.isdigit():
+            return part.capitalize()
+    return None
+
+def scan_folder(folder: Path, known_projects: list[str],
+                recursive: bool = True) -> list[dict]:
+    files = []
+    hashes: dict[str, str] = {}
+    skip_dirs = set(CATEGORIES.keys()) | {"Autres", "Doublons"}
+
+    iterator = folder.rglob("*") if recursive else folder.iterdir()
+    for f in iterator:
+        if not f.is_file():
+            continue
+        # Ignore les dossiers déjà créés par l'outil
+        rel_parts = f.relative_to(folder).parts
+        if any(p in skip_dirs for p in rel_parts[:-1]):
+            continue
+        cat     = get_category(f.suffix)
+        fhash   = file_hash(f)
+        is_dup  = (fhash in hashes) if fhash else False
+        if fhash and not is_dup:
+            hashes[fhash] = str(f)
+        files.append({
+            "path":         f,
+            "name":         f.name,
+            "ext":          f.suffix.lower(),
+            "category":     cat,
+            "project":      extract_project(f.name, known_projects),
+            "is_duplicate": is_dup,
+            "hash":         fhash,
+            "ai_name":      None,
+        })
+    return files
+
+def sanitize(name: str) -> str:
+    """Rend un nom sûr pour Windows."""
+    name = re.sub(r'[\\/:*?"<>|\s]', "_", name)
+    name = re.sub(r"_+", "_", name).strip("_")
+    return name[:80]  # max 80 chars
+
+def safe_dest(dest_folder: Path, base_name: str, ext: str) -> Path:
+    """Retourne un chemin libre (ajoute _1, _2... si nécessaire)."""
+    dest = dest_folder / (base_name + ext)
+    counter = 1
+    while dest.exists():
+        dest = dest_folder / f"{base_name}_{counter}{ext}"
+        counter += 1
+    return dest
+
+# ─── OpenAI ───────────────────────────────────────────────────────────────────
+def get_ai_client(api_key: str):
+    try:
+        from openai import OpenAI
+        return OpenAI(api_key=api_key)
+    except Exception:
+        return None
+
+def ai_suggest(client, filename: str, category: str, memory: dict) -> str | None:
+    past = list(memory.get("renamings", {}).items())[-8:]
+    past_str = ", ".join(f"{k}->{v}" for k, v in past) or "aucun"
+    prompt = (
+        "You help a 3D game art student rename work files. "
+        "Reply with ONE short filename (no extension, no spaces, use underscores, max 30 chars). "
+        "Nothing else — just the name.\n"
+        f"File: {filename}\nCategory: {category}\nPast renamings: {past_str}"
+    )
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=25,
+            temperature=0.3,
+        )
+        raw = resp.choices[0].message.content.strip()
+        return sanitize(raw) or None
+    except Exception as e:
+        print(f"[AI] {filename}: {e}")
+        return None
+
+# ─── Application ──────────────────────────────────────────────────────────────
+class App(ctk.CTk if CTK else tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("File Organizer Pro")
+        self.geometry("1000x720")
+        self.minsize(860, 580)
+
+        # Données
+        self.cfg     = load_json(CONFIG_F, {"api_key": "", "theme": "Sombre Violet", "recursive": True})
+        self.memory  = load_json(MEMORY_F, {"renamings": {}, "projects": []})
+        self.history = load_json(HISTORY_F, [])
+
+        self.theme_name = tk.StringVar(value=self.cfg.get("theme", "Sombre Violet"))
+        self.T          = THEMES[self.theme_name.get()]
+        self.folder_var = tk.StringVar()
+        self.recursive  = tk.BooleanVar(value=self.cfg.get("recursive", True))
+        self.scanned: list[dict] = []
+        self.ai_client  = get_ai_client(self.cfg.get("api_key", ""))
+
+        if CTK:
+            ctk.set_appearance_mode(self.T["mode"])
+            ctk.set_default_color_theme("blue")
+
+        self._apply_theme()
+        self._build()
+
+    # ── Thème ────────────────────────────────────────────────────────────────
+    def _apply_theme(self):
+        self.T = THEMES[self.theme_name.get()]
+        self.configure(bg=self.T["bg"])
+
+    def _switch_theme(self, name):
+        self.theme_name.set(name)
+        self.cfg["theme"] = name
+        save_json(CONFIG_F, self.cfg)
+        self._apply_theme()
+        if CTK:
+            ctk.set_appearance_mode(self.T["mode"])
+        # Rebuild UI
+        for w in self.winfo_children():
+            w.destroy()
+        self._build()
+
+    # ── Construction UI ──────────────────────────────────────────────────────
+    def _build(self):
+        T = self.T
+
+        # ── Header ──────────────────────────────────────────────────────────
+        header = tk.Frame(self, bg=T["bg2"], pady=14)
+        header.pack(fill="x")
+
+        tk.Label(header, text="⚡ File Organizer Pro",
+                 font=("Segoe UI", 20, "bold"), bg=T["bg2"], fg=T["text"]).pack(side="left", padx=20)
+
+        # Sélecteur de thème
+        theme_frame = tk.Frame(header, bg=T["bg2"])
+        theme_frame.pack(side="right", padx=16)
+        tk.Label(theme_frame, text="Thème :", font=("Segoe UI", 9),
+                 bg=T["bg2"], fg=T["text2"]).pack(side="left", padx=(0,6))
+        for name, emoji in [("Sombre Violet","🟣"), ("Sombre Bleu","🔵"), ("Clair","⚪")]:
+            active = name == self.theme_name.get()
+            tk.Button(theme_frame, text=f"{emoji} {name}",
+                      font=("Segoe UI", 8, "bold" if active else "normal"),
+                      bg=T["accent"] if active else T["bg3"],
+                      fg=T["text"], relief="flat", cursor="hand2",
+                      padx=8, pady=4,
+                      command=lambda n=name: self._switch_theme(n)
+                      ).pack(side="left", padx=2)
+
+        # ── API Key ──────────────────────────────────────────────────────────
+        api_row = tk.Frame(self, bg=T["bg3"], pady=7, padx=16)
+        api_row.pack(fill="x")
+        tk.Label(api_row, text="🔑 Clé OpenAI :", font=("Segoe UI", 9, "bold"),
+                 bg=T["bg3"], fg=T["text2"]).pack(side="left")
+        self.entry_key = tk.Entry(api_row, show="*", font=("Segoe UI", 9), width=52,
+                                  bg=T["bg2"], fg=T["text"], insertbackground=T["text"],
+                                  relief="flat", bd=4)
+        self.entry_key.insert(0, self.cfg.get("api_key",""))
+        self.entry_key.pack(side="left", padx=8, ipady=4)
+        self._btn(api_row, "💾 Sauvegarder", self._save_key).pack(side="left")
+        self.lbl_ai = tk.Label(api_row, text="", font=("Segoe UI", 9), bg=T["bg3"])
+        self.lbl_ai.pack(side="left", padx=10)
+        self._refresh_ai_status()
+
+        # ── Dossier ──────────────────────────────────────────────────────────
+        path_frame = tk.Frame(self, bg=T["bg"], pady=10, padx=16)
+        path_frame.pack(fill="x")
+        tk.Label(path_frame, text="📁 Dossier :", font=("Segoe UI", 10, "bold"),
+                 bg=T["bg"], fg=T["text"]).pack(anchor="w")
+        row = tk.Frame(path_frame, bg=T["bg"])
+        row.pack(fill="x", pady=4)
+        tk.Entry(row, textvariable=self.folder_var, font=("Segoe UI", 10),
+                 bg=T["bg2"], fg=T["text"], insertbackground=T["text"],
+                 relief="flat", bd=6).pack(side="left", fill="x", expand=True, ipady=6)
+        self._btn(row, "Parcourir", self._browse).pack(side="left", padx=(8,0))
+        tk.Checkbutton(row, text="Sous-dossiers", variable=self.recursive,
+                       bg=T["bg"], fg=T["text"], selectcolor=T["bg2"],
+                       activebackground=T["bg"], activeforeground=T["text"],
+                       font=("Segoe UI", 9)).pack(side="left", padx=10)
+
+        # ── Projets ──────────────────────────────────────────────────────────
+        proj_row = tk.Frame(self, bg=T["bg"], padx=16)
+        proj_row.pack(fill="x", pady=(0,6))
+        tk.Label(proj_row, text="🗂️ Projets (séparés par des virgules) :",
+                 font=("Segoe UI", 9), bg=T["bg"], fg=T["text2"]).pack(side="left")
+        self.entry_proj = tk.Entry(proj_row, font=("Segoe UI", 9), width=45,
+                                   bg=T["bg2"], fg=T["text"], insertbackground=T["text"],
+                                   relief="flat", bd=4)
+        self.entry_proj.insert(0, ", ".join(self.memory.get("projects",[])))
+        self.entry_proj.pack(side="left", padx=8, ipady=3)
+
+        # ── Boutons action ───────────────────────────────────────────────────
+        btn_row = tk.Frame(self, bg=T["bg"], padx=16, pady=4)
+        btn_row.pack(fill="x")
+        self.btn_scan = self._btn(btn_row, "🔍 Analyser", self._scan, secondary=True)
+        self.btn_scan.pack(side="left")
+        self.btn_ai = self._btn(btn_row, "🧠 Suggestions IA", self._run_ai, secondary=True)
+        self.btn_ai.pack(side="left", padx=8)
+        self.btn_ai.config(state="disabled")
+        self.btn_undo = self._btn(btn_row, "↩️ Annuler dernière action", self._undo, secondary=True)
+        self.btn_undo.pack(side="left")
+        self.btn_undo.config(state="normal" if self.history else "disabled")
+
+        # ── Tableau ──────────────────────────────────────────────────────────
+        tk.Label(self, text="Aperçu :", font=("Segoe UI", 10, "bold"),
+                 bg=T["bg"], fg=T["text"], padx=16).pack(anchor="w", pady=(10,2))
+
+        tree_wrap = tk.Frame(self, bg=T["bg"], padx=16)
+        tree_wrap.pack(fill="both", expand=True)
+
+        from tkinter import ttk
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Pro.Treeview",
+                        background=T["bg2"], foreground=T["text"],
+                        fieldbackground=T["bg2"], rowheight=28,
+                        font=("Segoe UI", 9))
+        style.configure("Pro.Treeview.Heading",
+                        background=T["bg3"], foreground=T["text2"],
+                        font=("Segoe UI", 9, "bold"), relief="flat")
+        style.map("Pro.Treeview", background=[("selected", T["accent"])])
+
+        cols = ("Nom original", "Catégorie", "Projet", "Nom IA", "Doublon")
+        self.tree = ttk.Treeview(tree_wrap, columns=cols, show="headings",
+                                 style="Pro.Treeview", height=12)
+        widths = [230, 110, 120, 190, 80]
+        anchors = ("w","center","center","w","center")
+        for col, w, a in zip(cols, widths, anchors):
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=w, anchor=a)
+
+        sb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        # ── Barre de progression ─────────────────────────────────────────────
+        self.progress_var = tk.DoubleVar()
+        self.lbl_progress = tk.Label(self, text="", font=("Segoe UI", 9),
+                                     bg=T["bg"], fg=T["text2"])
+        self.lbl_progress.pack(pady=(6,0))
+        from tkinter import ttk
+        ttk.Progressbar(self, variable=self.progress_var,
+                        maximum=100, length=500, mode="determinate").pack()
+
+        # ── Bas ──────────────────────────────────────────────────────────────
+        bottom = tk.Frame(self, bg=T["bg"], padx=16, pady=10)
+        bottom.pack(fill="x")
+        self.lbl_count = tk.Label(bottom, text="", font=("Segoe UI", 10),
+                                  bg=T["bg"], fg=T["text2"])
+        self.lbl_count.pack(side="left")
+        self.btn_go = self._btn(bottom, "✨ Organiser maintenant", self._organize, big=True)
+        self.btn_go.pack(side="right")
+        self.btn_go.config(state="disabled")
+
+    # ── Widget helper ────────────────────────────────────────────────────────
+    def _btn(self, parent, text, cmd, secondary=False, big=False):
+        T = self.T
+        return tk.Button(
+            parent, text=text, command=cmd,
+            font=("Segoe UI", 12 if big else 10, "bold" if big else "normal"),
+            bg=T["bg3"] if secondary else T["accent"],
+            fg=T["text"],
+            activebackground=T["bg2"] if secondary else T["accent2"],
+            activeforeground=T["text"],
+            relief="flat", cursor="hand2",
+            padx=20 if big else 12,
+            pady=10 if big else 6,
+        )
+
+    # ── Actions ──────────────────────────────────────────────────────────────
+    def _refresh_ai_status(self):
+        if self.ai_client:
+            self.lbl_ai.config(text="✅ IA prête", fg=self.T["success"],
+                               bg=self.T["bg3"])
+        else:
+            self.lbl_ai.config(text="⚠️ IA non connectée", fg=self.T["warning"],
+                               bg=self.T["bg3"])
+
+    def _save_key(self):
+        key = self.entry_key.get().strip()
+        self.cfg["api_key"] = key
+        save_json(CONFIG_F, self.cfg)
+        self.ai_client = get_ai_client(key)
+        self._refresh_ai_status()
+        if self.ai_client:
+            messagebox.showinfo("Succès", "Clé API sauvegardée ✅")
+            if self.scanned:
+                self.btn_ai.config(state="normal")
+        else:
+            messagebox.showerror("Erreur", "Clé API invalide ou openai non installé.\nLance : pip install openai")
+
+    def _browse(self):
+        folder = filedialog.askdirectory(title="Choisir un dossier")
+        if folder:
+            self.folder_path_str = folder
+            self.folder_var.set(folder)
+
+    def _get_projects(self) -> list[str]:
+        return [p.strip() for p in self.entry_proj.get().split(",") if p.strip()]
+
+    def _scan(self):
+        path_str = self.folder_var.get().strip()
+        if not path_str or not Path(path_str).is_dir():
+            messagebox.showerror("Erreur", "Sélectionne un dossier valide.")
+            return
+        projects = self._get_projects()
+        self.memory["projects"] = projects
+        save_json(MEMORY_F, self.memory)
+
+        self.scanned = scan_folder(Path(path_str), projects, self.recursive.get())
+        self._refresh_tree()
+
+        n    = len(self.scanned)
+        dups = sum(1 for f in self.scanned if f["is_duplicate"])
+        self.lbl_count.config(text=f"{n} fichier(s) — {dups} doublon(s)")
+        self.btn_go.config(state="normal" if n else "disabled")
+        self.btn_ai.config(state="normal" if n and self.ai_client else "disabled")
+        self.progress_var.set(0)
+        self.lbl_progress.config(text="")
+
+    def _refresh_tree(self):
+        self.tree.delete(*self.tree.get_children())
+        for f in self.scanned:
+            icon = CATEGORIES.get(f["category"], {}).get("icon", "📎")
+            row = (
+                f["name"],
+                f"{icon} {f['category']}",
+                f["project"] or "—",
+                f["ai_name"] or "—",
+                "⚠️" if f["is_duplicate"] else "",
+            )
+            tag = "dup" if f["is_duplicate"] else ""
+            self.tree.insert("", "end", values=row, tags=(tag,))
+        self.tree.tag_configure("dup", foreground=self.T["warning"])
+
+    def _run_ai(self):
+        if not self.ai_client:
+            messagebox.showwarning("IA", "Entre une clé API valide.")
+            return
+        self.btn_ai.config(state="disabled")
+        self.btn_scan.config(state="disabled")
+        self.btn_go.config(state="disabled")
+
+        def worker():
+            total = len(self.scanned)
+            for i, f in enumerate(self.scanned):
+                if not f["is_duplicate"]:
+                    suggestion = ai_suggest(self.ai_client, f["name"],
+                                            f["category"], self.memory)
+                    if suggestion:
+                        f["ai_name"] = suggestion + f["ext"]
+                pct = (i + 1) / total * 100
+                self.progress_var.set(pct)
+                self.lbl_progress.config(text=f"🧠 IA : {f['name']} ({i+1}/{total})")
+                self.update_idletasks()
+
+            self._refresh_tree()
+            self.lbl_progress.config(text="✅ Suggestions IA générées !")
+            self.btn_ai.config(state="normal")
+            self.btn_scan.config(state="normal")
+            self.btn_go.config(state="normal")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _organize(self):
+        if not self.scanned:
+            return
+        folder = Path(self.folder_var.get())
+        dups   = sum(1 for f in self.scanned if f["is_duplicate"])
+        msg = f"{len(self.scanned)} fichier(s) vont être déplacés et renommés."
+        if dups:
+            msg += f"\n⚠️ {dups} doublon(s) → dossier 'Doublons'"
+        if not messagebox.askyesno("Confirmer", msg + "\n\nContinuer ?"):
+            return
+
+        self.btn_go.config(state="disabled")
+        self.btn_scan.config(state="disabled")
+        counters: dict[str,int] = {}
+        session_moves = []
+
+        def worker():
+            total = len(self.scanned)
+            for i, f in enumerate(self.scanned):
+                # Dossier de destination
+                if f["is_duplicate"]:
+                    dest_dir = folder / "Doublons"
+                elif f["project"]:
+                    dest_dir = folder / f["category"] / f["project"]
+                else:
+                    dest_dir = folder / f["category"]
+                dest_dir.mkdir(parents=True, exist_ok=True)
+
+                # Nom final
+                if f["ai_name"]:
+                    base = sanitize(Path(f["ai_name"]).stem)
+                else:
+                    cat = f["category"]
+                    counters[cat] = counters.get(cat, 0) + 1
+                    base = f"{cat}_{str(counters[cat]).zfill(3)}"
+
+                dest_path = safe_dest(dest_dir, base, f["ext"])
+
+                try:
+                    shutil.move(str(f["path"]), str(dest_path))
+                    session_moves.append({
+                        "src": str(dest_path),
+                        "dst": str(f["path"]),
+                    })
+                    self.memory["renamings"][f["name"]] = dest_path.name
+                except Exception as e:
+                    print(f"[MOVE ERROR] {f['name']}: {e}")
+
+                pct = (i + 1) / total * 100
+                self.progress_var.set(pct)
+                self.lbl_progress.config(text=f"✅ {dest_path.name} ({i+1}/{total})")
+                self.update_idletasks()
+
+            # Sauvegarde historique & mémoire
+            if session_moves:
+                self.history.append({
+                    "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "moves": session_moves,
+                })
+                save_json(HISTORY_F, self.history)
+                save_json(MEMORY_F, self.memory)
+
+            self.lbl_progress.config(text=f"🎉 {total} fichier(s) organisé(s) !")
+            self.btn_scan.config(state="normal")
+            self.btn_undo.config(state="normal")
+            self.scanned = []
+            self._refresh_tree()
+            self.lbl_count.config(text="")
+            messagebox.showinfo("Terminé !", f"🎉 {len(session_moves)} fichiers organisés avec succès !")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _undo(self):
+        if not self.history:
+            messagebox.showinfo("Annuler", "Aucune action à annuler.")
+            return
+        last = self.history[-1]
+        moves = last.get("moves", [])
+        if not messagebox.askyesno("Annuler",
+            f"Annuler l'action du {last['date']} ?\n({len(moves)} fichier(s))"):
+            return
+
+        errors = 0
+        for m in moves:
+            try:
+                src = Path(m["src"])
+                dst = Path(m["dst"])
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dst))
+            except Exception as e:
+                print(f"[UNDO] {e}")
+                errors += 1
+
+        self.history.pop()
+        save_json(HISTORY_F, self.history)
+        if errors:
+            messagebox.showwarning("Annulation partielle",
+                f"{errors} fichier(s) n'ont pas pu être restaurés.")
+        else:
+            messagebox.showinfo("Annulé ✅", "Tous les fichiers ont été restaurés !")
+        self.btn_undo.config(state="normal" if self.history else "disabled")
+
+# ─── Entry point ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    # Auto-install des dépendances si manquantes
+    import subprocess, sys
+    for pkg in ["customtkinter", "openai"]:
+        try:
+            __import__(pkg.replace("-","_"))
+        except ImportError:
+            print(f"Installation de {pkg}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
+
+    try:
+        import customtkinter as ctk
+        CTK = True
+    except ImportError:
+        CTK = False
+        import tkinter as ctk
+
+    app = App()
+    app.mainloop()
